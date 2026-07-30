@@ -39,8 +39,9 @@ enum SystemState {
 
 SystemState currentState = IDLE;
 
-unsigned long sessionStartTime = 0;
-unsigned long sessionDurationMs = 0;
+// Timer tracking variables for pause/resume capability
+unsigned long remainingTimeMs = 0;
+unsigned long lastUpdateTime = 0; 
 int globalTargetMinutes = 1; // Tracked globally for the web server
 
 // Arming delay variables
@@ -138,10 +139,8 @@ void handleData() {
     }
   } else if (currentState == ACTIVE || currentState == ALARM) {
     stateStr = (currentState == ACTIVE) ? "ACTIVE" : "ALARM";
-    unsigned long elapsed = millis() - sessionStartTime;
-    if (sessionDurationMs > elapsed) {
-      remaining = sessionDurationMs - elapsed;
-    }
+    // Send the currently stored remaining time (which naturally pauses during ALARM)
+    remaining = remainingTimeMs;
   } else if (currentState == FINISHED) {
     stateStr = "FINISHED";
   }
@@ -233,9 +232,7 @@ void loop() {
         armingStartTime = millis();
         currentState = ARMING;
 
-        // Single beep to indicate the 30-second timer has started
         tone(BUZZER_PIN, 1000, 100);
-
         Serial.println(">> ARMING... You have 30 seconds to place your phone over the LDR. <<");
       }
       break;
@@ -245,9 +242,9 @@ void loop() {
       unsigned long elapsedArmingTime = millis() - armingStartTime;
 
       if (elapsedArmingTime >= ARMING_DELAY_MS) {
-        // Arming time is over, start the actual session!
-        sessionDurationMs = (unsigned long)globalTargetMinutes * 60 * 1000;
-        sessionStartTime = millis();
+        // Arming over. Calculate total milliseconds needed and start the update clock.
+        remainingTimeMs = (unsigned long)globalTargetMinutes * 60 * 1000;
+        lastUpdateTime = millis();
         currentState = ACTIVE;
 
         // Two beeps to indicate the alarm is live
@@ -267,9 +264,14 @@ void loop() {
     }
 
     case ACTIVE: {
-      unsigned long elapsedTime = millis() - sessionStartTime;
+      // Calculate how much time has passed since the last loop iteration
+      unsigned long now = millis();
+      unsigned long elapsedSinceLastUpdate = now - lastUpdateTime;
+      lastUpdateTime = now; // update baseline for the next loop
 
-      if (elapsedTime >= sessionDurationMs) {
+      // Check if session is finished
+      if (elapsedSinceLastUpdate >= remainingTimeMs) {
+        remainingTimeMs = 0;
         currentState = FINISHED;
         Serial.println(">> SUCCESS! Study session completed! <<");
         
@@ -278,13 +280,16 @@ void loop() {
         tone(BUZZER_PIN, 784, 300); delay(350); 
         noTone(BUZZER_PIN);
         break;
+      } else {
+        // Decrement remaining time
+        remainingTimeMs -= elapsedSinceLastUpdate;
       }
 
       if (ldrValue < LIGHT_THRESHOLD) {
         currentState = ALARM;
-        Serial.print("!! ALARM: Light detected! (LDR Value: ");
-        Serial.print(ldrValue);
-        Serial.println(") !!");
+        Serial.print("!! ALARM: Light detected! Timer paused at ");
+        Serial.print(remainingTimeMs / 1000);
+        Serial.println(" seconds remaining !!");
       }
 
       if (buttonPressed) {
@@ -295,6 +300,8 @@ void loop() {
     }
 
     case ALARM: {
+      // While in this state, remainingTimeMs is NOT decremented.
+
       if (millis() - lastSirenToggle >= 150) {
         lastSirenToggle = millis();
         sirenPitchHigh = !sirenPitchHigh;
@@ -315,6 +322,11 @@ void loop() {
 
       if (ldrValue >= LIGHT_THRESHOLD) {
         noTone(BUZZER_PIN);
+        
+        // CRITICAL: Reset the 'lastUpdateTime' so it doesn't subtract the time 
+        // spent alarming during the next ACTIVE loop iteration.
+        lastUpdateTime = millis(); 
+        
         currentState = ACTIVE; 
         Serial.println("Phone placed back! Alarm muted, session resumed.");
         break;
