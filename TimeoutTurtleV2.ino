@@ -31,6 +31,7 @@ const int TONE_HIGH = 2000;
 // ==========================================
 enum SystemState {
   IDLE,       // Setting up timer
+  ARMING,     // 30-second grace period before alarm arms
   ACTIVE,     // Study session active, monitoring LDR
   ALARM,      // Phone picked up! Siren sounding
   FINISHED    // Timer completed successfully
@@ -41,6 +42,10 @@ SystemState currentState = IDLE;
 unsigned long sessionStartTime = 0;
 unsigned long sessionDurationMs = 0;
 int globalTargetMinutes = 1; // Tracked globally for the web server
+
+// Arming delay variables
+unsigned long armingStartTime = 0;
+const unsigned long ARMING_DELAY_MS = 30000; // 30 seconds
 
 // Button debounce helper
 bool lastButtonState = HIGH;
@@ -71,6 +76,7 @@ void handleRoot() {
       .label { font-size: 14px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-top: 15px; }
       .status { padding: 6px 14px; border-radius: 20px; font-weight: bold; display: inline-block; margin-bottom: 15px;}
       .status.IDLE { background: #e2e3e5; color: #383d41; }
+      .status.ARMING { background: #fff3cd; color: #856404; }
       .status.ACTIVE { background: #d4edda; color: #155724; }
       .status.ALARM { background: #f8d7da; color: #721c24; }
       .status.FINISHED { background: #cce5ff; color: #004085; }
@@ -85,7 +91,7 @@ void handleRoot() {
             document.getElementById('state').className = 'status ' + data.state;
             document.getElementById('target').innerText = data.target + ' min';
             
-            if(data.state === 'ACTIVE' || data.state === 'ALARM') {
+            if(data.state === 'ACTIVE' || data.state === 'ALARM' || data.state === 'ARMING') {
               let mins = Math.floor(data.remaining / 60000);
               let secs = Math.floor((data.remaining % 60000) / 1000);
               secs = secs < 10 ? '0' + secs : secs;
@@ -124,6 +130,12 @@ void handleData() {
   
   if (currentState == IDLE) {
     stateStr = "IDLE";
+  } else if (currentState == ARMING) {
+    stateStr = "ARMING";
+    unsigned long elapsed = millis() - armingStartTime;
+    if (ARMING_DELAY_MS > elapsed) {
+      remaining = ARMING_DELAY_MS - elapsed;
+    }
   } else if (currentState == ACTIVE || currentState == ALARM) {
     stateStr = (currentState == ACTIVE) ? "ACTIVE" : "ALARM";
     unsigned long elapsed = millis() - sessionStartTime;
@@ -218,15 +230,38 @@ void loop() {
       }
 
       if (buttonPressed) {
+        armingStartTime = millis();
+        currentState = ARMING;
+
+        // Single beep to indicate the 30-second timer has started
+        tone(BUZZER_PIN, 1000, 100);
+
+        Serial.println(">> ARMING... You have 30 seconds to place your phone over the LDR. <<");
+      }
+      break;
+    }
+
+    case ARMING: {
+      unsigned long elapsedArmingTime = millis() - armingStartTime;
+
+      if (elapsedArmingTime >= ARMING_DELAY_MS) {
+        // Arming time is over, start the actual session!
         sessionDurationMs = (unsigned long)globalTargetMinutes * 60 * 1000;
         sessionStartTime = millis();
         currentState = ACTIVE;
 
+        // Two beeps to indicate the alarm is live
         tone(BUZZER_PIN, 1000, 100);
         delay(120);
         tone(BUZZER_PIN, 2000, 150);
 
-        Serial.println(">> SESSION STARTED! Keep your phone over the LDR. <<");
+        Serial.println(">> SESSION STARTED! LDR is now armed. <<");
+        break;
+      }
+
+      if (buttonPressed) {
+        currentState = IDLE;
+        Serial.println("Arming canceled by user.");
       }
       break;
     }
