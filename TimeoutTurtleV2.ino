@@ -31,6 +31,7 @@ const int TONE_HIGH = 2000;
 // ==========================================
 enum SystemState {
   IDLE,       // Setting up timer
+  ARMING,     // 30-second grace period before alarm arms
   ACTIVE,     // Study session active, monitoring LDR
   ALARM,      // Phone picked up! Siren sounding
   FINISHED    // Timer completed successfully
@@ -38,9 +39,14 @@ enum SystemState {
 
 SystemState currentState = IDLE;
 
-unsigned long sessionStartTime = 0;
-unsigned long sessionDurationMs = 0;
+// Timer tracking variables for pause/resume capability
+unsigned long remainingTimeMs = 0;
+unsigned long lastUpdateTime = 0; 
 int globalTargetMinutes = 1; // Tracked globally for the web server
+
+// Arming delay variables
+unsigned long armingStartTime = 0;
+const unsigned long ARMING_DELAY_MS = 30000; // 30 seconds
 
 // Button debounce helper
 bool lastButtonState = HIGH;
@@ -71,6 +77,7 @@ void handleRoot() {
       .label { font-size: 14px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-top: 15px; }
       .status { padding: 6px 14px; border-radius: 20px; font-weight: bold; display: inline-block; margin-bottom: 15px;}
       .status.IDLE { background: #e2e3e5; color: #383d41; }
+      .status.ARMING { background: #fff3cd; color: #856404; }
       .status.ACTIVE { background: #d4edda; color: #155724; }
       .status.ALARM { background: #f8d7da; color: #721c24; }
       .status.FINISHED { background: #cce5ff; color: #004085; }
@@ -85,7 +92,7 @@ void handleRoot() {
             document.getElementById('state').className = 'status ' + data.state;
             document.getElementById('target').innerText = data.target + ' min';
             
-            if(data.state === 'ACTIVE' || data.state === 'ALARM') {
+            if(data.state === 'ACTIVE' || data.state === 'ALARM' || data.state === 'ARMING') {
               let mins = Math.floor(data.remaining / 60000);
               let secs = Math.floor((data.remaining % 60000) / 1000);
               secs = secs < 10 ? '0' + secs : secs;
@@ -124,12 +131,16 @@ void handleData() {
   
   if (currentState == IDLE) {
     stateStr = "IDLE";
+  } else if (currentState == ARMING) {
+    stateStr = "ARMING";
+    unsigned long elapsed = millis() - armingStartTime;
+    if (ARMING_DELAY_MS > elapsed) {
+      remaining = ARMING_DELAY_MS - elapsed;
+    }
   } else if (currentState == ACTIVE || currentState == ALARM) {
     stateStr = (currentState == ACTIVE) ? "ACTIVE" : "ALARM";
-    unsigned long elapsed = millis() - sessionStartTime;
-    if (sessionDurationMs > elapsed) {
-      remaining = sessionDurationMs - elapsed;
-    }
+    // Send the currently stored remaining time (which naturally pauses during ALARM)
+    remaining = remainingTimeMs;
   } else if (currentState == FINISHED) {
     stateStr = "FINISHED";
   }
@@ -218,23 +229,49 @@ void loop() {
       }
 
       if (buttonPressed) {
-        sessionDurationMs = (unsigned long)globalTargetMinutes * 60 * 1000;
-        sessionStartTime = millis();
+        armingStartTime = millis();
+        currentState = ARMING;
+
+        tone(BUZZER_PIN, 1000, 100);
+        Serial.println(">> ARMING... You have 30 seconds to place your phone over the LDR. <<");
+      }
+      break;
+    }
+
+    case ARMING: {
+      unsigned long elapsedArmingTime = millis() - armingStartTime;
+
+      if (elapsedArmingTime >= ARMING_DELAY_MS) {
+        // Arming over. Calculate total milliseconds needed and start the update clock.
+        remainingTimeMs = (unsigned long)globalTargetMinutes * 60 * 1000;
+        lastUpdateTime = millis();
         currentState = ACTIVE;
 
+        // Two beeps to indicate the alarm is live
         tone(BUZZER_PIN, 1000, 100);
         delay(120);
         tone(BUZZER_PIN, 2000, 150);
 
-        Serial.println(">> SESSION STARTED! Keep your phone over the LDR. <<");
+        Serial.println(">> SESSION STARTED! LDR is now armed. <<");
+        break;
+      }
+
+      if (buttonPressed) {
+        currentState = IDLE;
+        Serial.println("Arming canceled by user.");
       }
       break;
     }
 
     case ACTIVE: {
-      unsigned long elapsedTime = millis() - sessionStartTime;
+      // Calculate how much time has passed since the last loop iteration
+      unsigned long now = millis();
+      unsigned long elapsedSinceLastUpdate = now - lastUpdateTime;
+      lastUpdateTime = now; // update baseline for the next loop
 
-      if (elapsedTime >= sessionDurationMs) {
+      // Check if session is finished
+      if (elapsedSinceLastUpdate >= remainingTimeMs) {
+        remainingTimeMs = 0;
         currentState = FINISHED;
         Serial.println(">> SUCCESS! Study session completed! <<");
         
@@ -243,13 +280,16 @@ void loop() {
         tone(BUZZER_PIN, 784, 300); delay(350); 
         noTone(BUZZER_PIN);
         break;
+      } else {
+        // Decrement remaining time
+        remainingTimeMs -= elapsedSinceLastUpdate;
       }
 
       if (ldrValue < LIGHT_THRESHOLD) {
         currentState = ALARM;
-        Serial.print("!! ALARM: Light detected! (LDR Value: ");
-        Serial.print(ldrValue);
-        Serial.println(") !!");
+        Serial.print("!! ALARM: Light detected! Timer paused at ");
+        Serial.print(remainingTimeMs / 1000);
+        Serial.println(" seconds remaining !!");
       }
 
       if (buttonPressed) {
@@ -260,6 +300,8 @@ void loop() {
     }
 
     case ALARM: {
+      // While in this state, remainingTimeMs is NOT decremented.
+
       if (millis() - lastSirenToggle >= 150) {
         lastSirenToggle = millis();
         sirenPitchHigh = !sirenPitchHigh;
@@ -280,6 +322,11 @@ void loop() {
 
       if (ldrValue >= LIGHT_THRESHOLD) {
         noTone(BUZZER_PIN);
+        
+        // CRITICAL: Reset the 'lastUpdateTime' so it doesn't subtract the time 
+        // spent alarming during the next ACTIVE loop iteration.
+        lastUpdateTime = millis(); 
+        
         currentState = ACTIVE; 
         Serial.println("Phone placed back! Alarm muted, session resumed.");
         break;
